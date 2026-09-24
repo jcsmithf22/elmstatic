@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Prepare a fresh orb to build and smoke-test elmstatic.
+# Idempotent: a warm snapshot should skip downloads and finish in seconds.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+step() {
+  local label="$1"
+  shift
+  local start
+  start="$(date +%s)"
+  echo "==> ${label}"
+  "$@"
+  echo "    ${label} ($(( $(date +%s) - start ))s)"
+}
+
+# Base orb image already has node, npm, git, curl, ca-certificates, and build-essential.
+# Skip apt unless a required package is actually missing so warm snapshots stay fast.
+required_packages=(ca-certificates curl gzip)
+missing_packages=()
+for package in "${required_packages[@]}"; do
+  if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "install ok installed"; then
+    missing_packages+=("$package")
+  fi
+done
+if ((${#missing_packages[@]} > 0)); then
+  step "install system packages (${missing_packages[*]})" sudo apt-get update
+  step "apt-get install" sudo apt-get install -y "${missing_packages[@]}"
+else
+  echo "==> system packages already installed"
+fi
+
+# Scaffolds pin elm-version 0.19.1. The npm `elm` package's install script is
+# broken on modern Node, so install the official GitHub binary instead.
+# 0.19.2 cannot compile 0.19.1 elm.json files.
+ELM_VERSION="0.19.1"
+ELM_URL="https://github.com/elm/compiler/releases/download/${ELM_VERSION}/binary-for-linux-64-bit.gz"
+ELM_BIN="/usr/local/bin/elm"
+if ! command -v elm >/dev/null 2>&1 || ! elm --version 2>/dev/null | grep -qx "$ELM_VERSION"; then
+  step "install Elm ${ELM_VERSION}" bash -c "
+    tmp=\$(mktemp)
+    curl -fsSL -o \"\$tmp\" '$ELM_URL'
+    gunzip -c \"\$tmp\" > '${ELM_BIN}.new'
+    rm -f \"\$tmp\"
+    chmod 755 '${ELM_BIN}.new'
+    mv '${ELM_BIN}.new' '$ELM_BIN'
+  "
+else
+  echo "==> Elm ${ELM_VERSION} already installed"
+fi
+
+# npm-shrinkwrap.json is lockfileVersion 2. `npm ci` always deletes and
+# reinstalls, so on a warm snapshot compare installed versions first and only
+# reinstall when they differ. Ignore optional packages for other platforms
+# (fsevents is darwin-only and is absent on Linux).
+if node <<'EOF'
+const fs = require("fs")
+const lock = JSON.parse(fs.readFileSync("npm-shrinkwrap.json", "utf8"))
+let installed
+try {
+  installed = JSON.parse(fs.readFileSync("node_modules/.package-lock.json", "utf8"))
+} catch {
+  process.exit(1)
+}
+const wanted = lock.packages || {}
+const have = installed.packages || {}
+for (const [name, meta] of Object.entries(wanted)) {
+  if (name === "") continue
+  const os = meta.os
+  if (Array.isArray(os) && !os.includes("linux") && !os.includes("!linux")) continue
+  if (!have[name] || have[name].version !== meta.version) process.exit(1)
+}
+EOF
+then
+  echo "==> npm dependencies already match npm-shrinkwrap.json"
+else
+  step "install npm dependencies" npm ci
+fi
+
+# Warm the Elm package cache used by `npm test` (markdown and elm-markup
+# scaffolds). elm make downloads into ~/.elm, which the project snapshot keeps.
+# Skip a scaffold when its distinguishing package is already cached.
+elm_home="${ELM_HOME:-$HOME/.elm}/${ELM_VERSION}/packages"
+warm_elm_cache() {
+  local cache_root scaffold
+  cache_root="$(mktemp -d)"
+  for scaffold in "$@"; do
+    cp -a "scaffold/${scaffold}" "${cache_root}/${scaffold}"
+    (cd "${cache_root}/${scaffold}" && elm make _layouts/Page.elm --output=/dev/null)
+  done
+  rm -rf "$cache_root"
+}
+scaffolds_to_warm=()
+[[ -d "${elm_home}/elm-explorations/markdown" ]] || scaffolds_to_warm+=(md)
+[[ -d "${elm_home}/mdgriffith/elm-markup" ]] || scaffolds_to_warm+=(emu)
+if ((${#scaffolds_to_warm[@]} > 0)); then
+  step "warm Elm package cache (${scaffolds_to_warm[*]})" warm_elm_cache "${scaffolds_to_warm[@]}"
+else
+  echo "==> Elm package cache already warm"
+fi
+
+echo "==> setup complete"
+elm --version
+node --version
+npm --version

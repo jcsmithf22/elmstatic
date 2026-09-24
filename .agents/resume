@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Fast wake hook. Dependencies are installed by .agents/setup and restored
+# from the project snapshot; do not install anything here.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+if ! command -v elm >/dev/null 2>&1; then
+  echo "elm is not on PATH; .agents/setup did not complete" >&2
+  exit 1
+fi
+
+if [[ ! -d node_modules ]]; then
+  echo "node_modules is missing; .agents/setup did not complete" >&2
+  exit 1
+fi
